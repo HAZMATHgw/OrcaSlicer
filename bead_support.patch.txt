@@ -1,0 +1,371 @@
+diff --git a/src/libslic3r/Support/SupportCommon.cpp b/src/libslic3r/Support/SupportCommon.cpp
+--- a/src/libslic3r/Support/SupportCommon.cpp
++++ b/src/libslic3r/Support/SupportCommon.cpp
+@@
+ #include "../ClipperUtils.hpp"
+ // #include "../ClipperZUtils.hpp"
+ #include "../ExtrusionEntityCollection.hpp"
++#include <cmath>
++#include <algorithm>
+ 
+@@
+         if (no_sort && ! eec->empty())
+             dst.emplace_back(eec.release());
+     }
+ }
++
++// ------------------------------------------------------------------
++// Bead support for a dedicated support extruder (Klipper dual-nozzle,
++// shared carriage). T0/T1 tool change + nozzle offset are handled by
++// firmware/slicer settings, so this code only needs to emit ordinary
++// support extrusion paths that get routed to the support extruder (T1).
++//
++// Design (vs. the earlier single-nozzle over-extrusion mock-up):
++//   1) Bead diameter is read from the support flow's nozzle_diameter(),
++//      never hardcoded.
++//   2) NO over-extrusion. Each bead is a very short segment extruded at
++//      the support flow's NORMAL mm3/mm. A 1 mm nozzle already lays a
++//      fat bead, so there is no need to inflate volume.
++//   3) Anti-fusion for reuse: layers are NOT staggered (beads stack in
++//      straight columns so they separate easily) and pitch >= diameter
++//      (neighbouring beads do not touch and weld together).
++//
++// The goal of the interface region is dense-but-not-fused: pitch only
++// slightly larger than the bead diameter for coverage against the model
++// underside, without pressing beads into one solid mass.
++// ------------------------------------------------------------------
++
++namespace {
++
++enum class SupportBeadRegion
++{
++    Body,
++    Contact
++};
++
++struct SupportBeadParams
++{
++    double bead_diameter_mm        = 1.00; // filled from flow.nozzle_diameter()
++    double pitch_ratio             = 1.15; // pitch = diameter * this (>= 1.0 => no fusion)
++    double edge_margin_ratio       = 0.55; // margin = diameter * this (keep beads inside)
++    double segment_ratio           = 0.60; // bead segment length = diameter * this
++    double flow_multiplier         = 1.00; // fine tune around NORMAL flow (not over-extrusion)
++    bool   stagger_layers          = false; // straight columns => easy separation / reuse
++    bool   snake_order             = true;
++    bool   alternate_contact_angle = true;
++};
++
++static SupportBeadParams support_bead_body_params(double bead_diameter_mm)
++{
++    SupportBeadParams p;
++    p.bead_diameter_mm        = bead_diameter_mm;
++    p.pitch_ratio             = 1.60; // wide => save material + guaranteed non-fusion
++    p.edge_margin_ratio       = 0.55;
++    p.segment_ratio           = 0.45;
++    p.flow_multiplier         = 0.90; // slightly leaner => weaker => easier removal
++    p.stagger_layers          = false;
++    p.snake_order             = true;
++    p.alternate_contact_angle = false;
++    return p;
++}
++
++static SupportBeadParams support_bead_contact_params(double bead_diameter_mm)
++{
++    SupportBeadParams p;
++    p.bead_diameter_mm        = bead_diameter_mm;
++    p.pitch_ratio             = 1.10; // just above diameter => dense but not fused
++    p.edge_margin_ratio       = 0.30;
++    p.segment_ratio           = 0.60;
++    p.flow_multiplier         = 1.00; // normal flow. do NOT press beads together.
++    p.stagger_layers          = false;
++    p.snake_order             = true;
++    p.alternate_contact_angle = true;
++    return p;
++}
++
++static bool support_bead_contains_point(const ExPolygons &expolys, const Point &pt)
++{
++    for (const ExPolygon &expoly : expolys)
++        if (expoly.contains(pt))
++            return true;
++    return false;
++}
++
++struct SupportBeadCenter
++{
++    Point center;
++    int   row = 0;
++};
++
++static std::vector<SupportBeadCenter> support_bead_generate_centers(
++    const Polygons &polygons,
++    const SupportBeadParams &params,
++    size_t support_layer_id)
++{
++    std::vector<SupportBeadCenter> centers;
++
++    if (polygons.empty())
++        return centers;
++
++    const double pitch_mm = params.bead_diameter_mm * params.pitch_ratio;
++    if (pitch_mm <= 0.0 || params.bead_diameter_mm <= 0.0)
++        return centers;
++
++    const coord_t edge_margin = scale_(params.bead_diameter_mm * params.edge_margin_ratio);
++    Polygons safe_polygons = shrink(polygons, edge_margin);
++
++    // Very thin interface islands can be erased by shrinking. Fall back to the
++    // original polygon and rely on per-center containment testing.
++    if (safe_polygons.empty())
++        safe_polygons = polygons;
++
++    ExPolygons safe_expolys = union_ex(safe_polygons);
++    BoundingBox bbox = get_extents(safe_polygons);
++
++    const coord_t pitch_x = scale_(pitch_mm);
++    const coord_t pitch_y = scale_(pitch_mm * std::sqrt(3.0) * 0.5);
++    if (pitch_x <= 0 || pitch_y <= 0)
++        return centers;
++
++    // stagger_layers == false => no per-layer shift => beads stack straight,
++    // which is what we want for easy separation / pellet reuse.
++    coord_t layer_shift_x = 0;
++    coord_t layer_shift_y = 0;
++    if (params.stagger_layers && (support_layer_id % 2 == 1)) {
++        layer_shift_x = pitch_x / 2;
++        layer_shift_y = pitch_y / 3;
++    }
++
++    int row = 0;
++    for (coord_t y = bbox.min.y() + layer_shift_y; y <= bbox.max.y(); y += pitch_y) {
++        const coord_t row_shift_x = (row % 2 == 0) ? 0 : pitch_x / 2;
++        std::vector<SupportBeadCenter> row_centers;
++
++        for (coord_t x = bbox.min.x() + row_shift_x + layer_shift_x; x <= bbox.max.x(); x += pitch_x) {
++            const Point center(x, y);
++            if (support_bead_contains_point(safe_expolys, center))
++                row_centers.push_back({ center, row });
++        }
++
++        // Snake order: row 0 left->right, row 1 right->left, ... to cut travel.
++        if (params.snake_order && (row % 2 == 1))
++            std::reverse(row_centers.begin(), row_centers.end());
++
++        centers.insert(centers.end(), row_centers.begin(), row_centers.end());
++        ++row;
++    }
++
++    return centers;
++}
++
++static Polyline support_bead_make_segment(
++    const Point &center,
++    const SupportBeadParams &params,
++    size_t support_layer_id,
++    SupportBeadRegion region)
++{
++    double angle = 0.0;
++
++    // Contact beads alternate segment direction per layer to widen coverage
++    // against the model underside without changing bead diameter.
++    if (region == SupportBeadRegion::Contact && params.alternate_contact_angle)
++        angle = (support_layer_id % 2 == 0) ? 0.0 : 1.5707963267948966;
++
++    const double seg_len_mm  = params.bead_diameter_mm * params.segment_ratio;
++    const double half_len_mm = 0.5 * seg_len_mm;
++    const coord_t dx = scale_(half_len_mm * std::cos(angle));
++    const coord_t dy = scale_(half_len_mm * std::sin(angle));
++
++    Polyline seg;
++    seg.points.emplace_back(center.x() - dx, center.y() - dy);
++    seg.points.emplace_back(center.x() + dx, center.y() + dy);
++    return seg;
++}
++
++static bool support_bead_generate_paths(
++    ExtrusionEntitiesPtr &dst,
++    const Polygons      &polygons,
++    ExtrusionRole        role,
++    const Flow          &flow,          // support-extruder (T1) flow; slicer routes it
++    const SupportBeadParams &params,
++    size_t               support_layer_id,
++    SupportBeadRegion    region)
++{
++    std::vector<SupportBeadCenter> centers =
++        support_bead_generate_centers(polygons, params, support_layer_id);
++
++    if (centers.empty())
++        return false;
++
++    Polylines segments;
++    segments.reserve(centers.size());
++    for (const SupportBeadCenter &c : centers)
++        segments.emplace_back(support_bead_make_segment(c.center, params, support_layer_id, region));
++
++    // NORMAL flow of the support extruder. No over-extrusion. The 1 mm nozzle
++    // itself produces a fat bead, so we only fine-tune with flow_multiplier.
++    const double mm3_per_mm = flow.mm3_per_mm() * params.flow_multiplier;
++
++    extrusion_entities_append_paths(
++        dst,
++        std::move(segments),
++        role,
++        mm3_per_mm,
++        flow.width(),
++        flow.height(),
++        false);
++
++    return true;
++}
++
++} // anonymous namespace
+ 
+ // Support layers, partially processed.
+ struct SupportGeneratorLayerExtruded {
+@@
+-                fill_expolygons_generate_paths(
+-                    // Destination
+-                    layer_ex.extrusions,
+-                    // Regions to fill
+-                    union_safety_offset_ex(layer_ex.polygons_to_extrude()),
+-                    // Filler and its parameters
+-                    filler,
+-                    float(density),
+-                    // Extrusion parameters
+-                    interface_as_base ? ExtrusionRole::erSupportMaterial : ExtrusionRole::erSupportMaterialInterface,
+-                    interface_flow);
++                // Bead contact/interface. Bead diameter comes from the support
++                // (interface) flow's nozzle, not a hardcoded value.
++                const ExtrusionRole interface_role =
++                    interface_as_base ? ExtrusionRole::erSupportMaterial : ExtrusionRole::erSupportMaterialInterface;
++
++                bool bead_generated = false;
++                if (! raft_contact) {
++                    SupportBeadParams contact_params =
++                        support_bead_contact_params(interface_flow.nozzle_diameter());
++
++                    bead_generated = support_bead_generate_paths(
++                        layer_ex.extrusions,
++                        layer_ex.polygons_to_extrude(),
++                        interface_role,
++                        interface_flow,
++                        contact_params,
++                        support_layer_id,
++                        SupportBeadRegion::Contact);
++                }
++
++                if (! bead_generated) {
++                    fill_expolygons_generate_paths(
++                        // Destination
++                        layer_ex.extrusions,
++                        // Regions to fill
++                        union_safety_offset_ex(layer_ex.polygons_to_extrude()),
++                        // Filler and its parameters
++                        filler,
++                        float(density),
++                        // Extrusion parameters
++                        interface_role,
++                        interface_flow);
++                }
+             }
+         };
+@@
+-                fill_expolygons_generate_paths(
+-                    // Destination
+-                    base_interface_layer.extrusions,
+-                    //base_layer_interface.extrusions,
+-                    // Regions to fill
+-                    union_safety_offset_ex(base_interface_layer.polygons_to_extrude()),
+-                    // Filler and its parameters
+-                    filler,
+-                    float(support_params.top_interface_density),
+-                    // Extrusion parameters
+-                    ExtrusionRole::erSupportMaterial,
+-                    interface_flow);
++                SupportBeadParams contact_params =
++                    support_bead_contact_params(interface_flow.nozzle_diameter());
++
++                bool bead_generated = support_bead_generate_paths(
++                    base_interface_layer.extrusions,
++                    base_interface_layer.polygons_to_extrude(),
++                    ExtrusionRole::erSupportMaterial,
++                    interface_flow,
++                    contact_params,
++                    support_layer_id,
++                    SupportBeadRegion::Contact);
++
++                if (! bead_generated) {
++                    fill_expolygons_generate_paths(
++                        // Destination
++                        base_interface_layer.extrusions,
++                        //base_layer_interface.extrusions,
++                        // Regions to fill
++                        union_safety_offset_ex(base_interface_layer.polygons_to_extrude()),
++                        // Filler and its parameters
++                        filler,
++                        float(support_params.top_interface_density),
++                        // Extrusion parameters
++                        ExtrusionRole::erSupportMaterial,
++                        interface_flow);
++                }
+             }
+ 
+             // Base support or flange.
+@@
+-                if (! done)
+-                    fill_expolygons_with_sheath_generate_paths(
+-                        // Destination
+-                        base_layer.extrusions,
+-                        // Regions to fill
+-                        base_layer.polygons_to_extrude(),
+-                        // Filler and its parameters
+-                        filler,
+-                        density,
+-                        // Extrusion parameters
+-                        ExtrusionRole::erSupportMaterial,
+-                        flow,
+-                        support_params,
+-                        sheath,
+-                        no_sort);
++                if (! done) {
++                    // Bead body. Keep the first support layer / sheath / no_sort
++                    // paths original for adhesion and structural reasons; above
++                    // that, use sparse straight-column beads for material saving
++                    // and easy separation.
++                    const bool first_support_layer = base_layer.layer->bottom_z < EPSILON;
++
++                    bool bead_generated = false;
++                    if (! first_support_layer && ! sheath && ! no_sort) {
++                        SupportBeadParams body_params =
++                            support_bead_body_params(flow.nozzle_diameter());
++
++                        bead_generated = support_bead_generate_paths(
++                            base_layer.extrusions,
++                            base_layer.polygons_to_extrude(),
++                            ExtrusionRole::erSupportMaterial,
++                            flow,
++                            body_params,
++                            support_layer_id,
++                            SupportBeadRegion::Body);
++                    }
++
++                    if (! bead_generated) {
++                        fill_expolygons_with_sheath_generate_paths(
++                            // Destination
++                            base_layer.extrusions,
++                            // Regions to fill
++                            base_layer.polygons_to_extrude(),
++                            // Filler and its parameters
++                            filler,
++                            density,
++                            // Extrusion parameters
++                            ExtrusionRole::erSupportMaterial,
++                            flow,
++                            support_params,
++                            sheath,
++                            no_sort);
++                    }
++                }
+         }
+ 
+         // Merge base_interface_layers to base_layers to avoid unneccessary retractions
